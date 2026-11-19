@@ -1,0 +1,68 @@
+"""Live view of the storage nodes: reachability, throughput, load, health checks, simulated failures."""
+import asyncio, time
+import httpx
+from fastapi import HTTPException
+from . import config
+
+client = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=config.NODE_CONNECT_TIMEOUT),
+                           limits=httpx.Limits(max_connections=config.MAX_NODE_CONNECTIONS, max_keepalive_connections=5),
+                           headers={"X-Node-Secret": config.NODE_SECRET} if config.NODE_SECRET else {})   # proves we are the coordinator
+up = {u: True for u in config.NODES}       # last known reachability
+tp = {u: 20.0 for u in config.NODES}       # smoothed throughput per node, MB/s
+held = [0] * len(config.NODES)             # replicas placed per node (restored from the DB at startup)
+names: dict[int, str] = {}
+
+def recommend(mbps: float) -> int:
+    """Chunk size (MB) ~ what a node can take in 0.4 s, snapped to the allowed sizes."""
+    return min(config.SIZES, key=lambda s: abs(s - mbps * 0.4))
+
+async def ping(i: int) -> dict:
+    url = config.NODES[i]
+    base = {"id": i, "url": url, "name": names.get(i, f"node-{i+1}"), "online": False,
+            "failed": False, "throughput_mbps": 0, "chunks": 0}
+    try:
+        r = await client.get(f"{url}/health", timeout=config.PING_TIMEOUT)
+        r.raise_for_status()
+        d = r.json(); up[url] = True; names[i] = d["name"]
+        return {**base, "name": d["name"], "online": True, "throughput_mbps": round(tp[url], 1), "chunks": d["chunks"]}
+    except httpx.HTTPStatusError as e:                        # node answered 503 = simulated failure
+        up[url] = False
+        return {**base, "failed": "simulated" in e.response.text}
+    except Exception:                                         # node process unreachable
+        up[url] = False
+        return base
+
+_cache: tuple[float, list] = (0.0, [])
+_inflight: "asyncio.Future | None" = None
+
+async def _collect() -> list[dict]:
+    global _cache
+    res = await asyncio.gather(*(ping(i) for i in range(len(config.NODES))))
+    _cache = (time.monotonic(), res)
+    return res
+
+async def health() -> list[dict]:
+    """Shared by every viewer: cached for 3 s, and concurrent callers share a single round of pings."""
+    if _cache[1] and time.monotonic() - _cache[0] < 3:
+        return _cache[1]
+    global _inflight
+    if _inflight is None or _inflight.done():
+        _inflight = asyncio.ensure_future(_collect())
+    return await asyncio.shield(_inflight)
+
+async def refresh(indices) -> None:
+    await asyncio.gather(*(ping(i) for i in set(indices)))
+
+async def admin(i: int, action: str) -> dict:
+    if not config.ALLOW_SIMULATION:
+        raise HTTPException(403, "failure simulation is disabled on this server")
+    if not 0 <= i < len(config.NODES):
+        raise HTTPException(404, "no such node")
+    try:
+        (await client.post(f"{config.NODES[i]}/admin/{action}", timeout=config.PING_TIMEOUT)).raise_for_status()
+    except Exception:
+        raise HTTPException(502, "node process is unreachable")
+    up[config.NODES[i]] = action == "recover"
+    global _cache
+    _cache = (0.0, [])                                        # next poll shows the change immediately
+    return {"ok": True, "node": i, "action": action}
